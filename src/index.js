@@ -12,13 +12,14 @@ app.use(express.urlencoded({ extended: true }));
 
 const now = () => Date.now();
 const rand = (n = 32) => crypto.randomBytes(n).toString('base64url');
+const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------------------------------------------------------------------------
 // This server is an OAuth proxy: it is an Authorization Server to the MCP
 // client (LibreChat), and an OAuth client to Accelo. The MCP client never
 // sees the Accelo token; it gets one of our opaque tokens, which we map to a
 // stored per-user Accelo token. This keeps Accelo's own permission model.
-// ---------------------------------------
+// ---------------------------------------------------------------------------
 
 // ---- Discovery ----
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
@@ -48,6 +49,7 @@ app.post('/register', (req, res) => {
   const redirect_uris = req.body.redirect_uris || [];
   db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at) VALUES (?,?,?,?)')
     .run(client_id, client_secret, JSON.stringify(redirect_uris), now());
+  log('[register] new client', client_id, 'redirect_uris=', JSON.stringify(redirect_uris));
   res.status(201).json({
     client_id,
     client_secret,
@@ -61,6 +63,7 @@ app.post('/register', (req, res) => {
 // ---- Authorize: validate client, stash PKCE/state, bounce to Accelo ----
 app.get('/authorize', (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
+  log('[authorize] incoming query=', JSON.stringify(req.query));
   if (response_type !== 'code') return res.status(400).send('unsupported_response_type');
   if (!client_id) return res.status(400).send('missing client_id');
 
@@ -86,18 +89,47 @@ app.get('/authorize', (req, res) => {
   u.searchParams.set('redirect_uri', config.redirectUri);
   u.searchParams.set('scope', config.scope);
   u.searchParams.set('state', ourState);
+  log('[authorize] stored ourState=', ourState, '-> redirecting to Accelo:', u.toString());
   res.redirect(u.toString());
 });
 
 // ---- Accelo redirects back here after the user consents ----
 app.get('/oauth/callback', async (req, res) => {
   try {
-    const { code, state } = req.query;
-    const st = db.prepare('SELECT * FROM auth_state WHERE state = ?').get(state);
-    if (!st) return res.status(400).send('invalid state');
-    db.prepare('DELETE FROM auth_state WHERE state = ?').run(state);
+    log('[callback] incoming query=', JSON.stringify(req.query));
+    const { code, state, error, error_description } = req.query;
+
+    // Accelo returns error + error_description (state echoed only if supplied)
+    if (error) {
+      log('[callback] Accelo returned error:', error, error_description);
+      return res.status(400).send(`Accelo authorization error: ${error} - ${error_description || ''}`);
+    }
+
+    // Look up by the state Accelo echoed back. If Accelo omitted state (a known
+    // quirk on some deployments), fall back to the single most-recent pending
+    // auth_state created in the last 10 minutes.
+    let st = state ? db.prepare('SELECT * FROM auth_state WHERE state = ?').get(state) : null;
+    if (!st) {
+      const recent = db.prepare(
+        'SELECT * FROM auth_state WHERE created_at > ? ORDER BY created_at DESC'
+      ).all(now() - 600000);
+      if (!state && recent.length === 1) {
+        st = recent[0];
+        log('[callback] state missing from Accelo; using sole recent auth_state', st.state);
+      } else {
+        log('[callback] no matching auth_state. received state=', state, 'pending rows=', recent.length);
+        return res.status(400).send('invalid state');
+      }
+    }
+    db.prepare('DELETE FROM auth_state WHERE state = ?').run(st.state);
+
+    if (!code) {
+      log('[callback] no code present in Accelo response');
+      return res.status(400).send('missing authorization code from Accelo');
+    }
 
     const tok = await exchangeAcceloCode(code);
+    log('[callback] Accelo token exchange ok; has_refresh=', !!tok.refresh_token, 'expires_in=', tok.expires_in);
     const subject = randomUUID();
     const expiresAt = now() + (tok.expires_in ? tok.expires_in * 1000 : 3600 * 1000);
     db.prepare(
@@ -112,8 +144,10 @@ app.get('/oauth/callback', async (req, res) => {
     const back = new URL(st.client_redirect_uri);
     back.searchParams.set('code', ourCode);
     if (st.client_state) back.searchParams.set('state', st.client_state);
+    log('[callback] success; redirecting back to client:', back.toString());
     res.redirect(back.toString());
   } catch (e) {
+    log('[callback] ERROR:', e.message);
     res.status(500).send('OAuth callback error: ' + e.message);
   }
 });
@@ -121,6 +155,7 @@ app.get('/oauth/callback', async (req, res) => {
 // ---- Token endpoint ----
 app.post('/token', (req, res) => {
   const { grant_type, code, code_verifier, refresh_token } = req.body;
+  log('[token] grant_type=', grant_type);
 
   if (grant_type === 'authorization_code') {
     const ac = db.prepare('SELECT * FROM auth_codes WHERE code = ?').get(code);

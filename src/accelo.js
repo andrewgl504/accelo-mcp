@@ -1,5 +1,7 @@
 import { config } from './config.js';
 
+const log = (...a) => console.log(new Date().toISOString(), '[accelo]', ...a);
+
 // Fields we request back from Accelo for quotes. Accelo hides most fields
 // unless explicitly requested via _fields.
 const QUOTE_FIELDS = [
@@ -23,14 +25,17 @@ async function acceloFetch(token, pathname, { method = 'GET', query, body } = {}
     opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     opts.body = new URLSearchParams(body).toString();
   }
+  log('->', method, url.toString(), body ? `body=${opts.body}` : '');
   const res = await fetch(url, opts);
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) {
+    log('<-', res.status, 'ERROR body=', text.slice(0, 800));
     const msg = (json && json.meta && json.meta.message) || text;
     throw new Error(`Accelo API ${method} ${pathname} failed: ${res.status} ${msg}`);
   }
+  log('<-', res.status, 'ok; response keys=', json && json.response ? (Array.isArray(json.response) ? `array[${json.response.length}]` : Object.keys(json.response).join(',')) : 'none');
   return json;
 }
 

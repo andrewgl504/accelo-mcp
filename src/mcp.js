@@ -7,6 +7,30 @@ function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
 }
 
+// Returned when a write tool is called without confirm:true. This is a
+// deliberate human-in-the-loop guard: the agent must echo the payload to the
+// user and obtain approval, then re-call the tool with confirm:true.
+function needsConfirmation(action, payload) {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(
+          {
+            status: 'confirmation_required',
+            message:
+              `This will ${action} in Accelo. Review the payload below with the user, ` +
+              'then call this tool again with confirm: true to proceed.',
+            pending: payload,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
 // Build a fresh MCP server bound to a specific authenticated subject
 // (i.e. one Accelo user). All Accelo calls run as that user, so Accelo's
 // own permission model is respected.
@@ -40,16 +64,16 @@ export function buildServer(subject) {
 
   server.tool(
     'create_quote',
-    'Create a new Accelo quote. title is required; other Accelo quote fields may be supplied.',
+    'Create a new Accelo quote. WRITE OPERATION: requires confirm:true. Call once without confirm to preview the payload, show it to the user for approval, then call again with confirm:true.',
     {
       title: z.string().describe('Quote title'),
       against_type: z.string().optional().describe("Object type the quote is against, e.g. 'company' or 'prospect'"),
       against_id: z.string().optional().describe('ID of the object the quote is against'),
       notes: z.string().optional().describe('Quote notes / body'),
       fields: z.record(z.string()).optional().describe('Any additional Accelo quote fields as key/value pairs'),
+      confirm: z.boolean().optional().describe('Must be true to actually create the quote. Omit/false to preview only.'),
     },
-    async ({ title, against_type, against_id, notes, fields }) => {
-      const token = await getValidAcceloToken(subject);
+    async ({ title, against_type, against_id, notes, fields, confirm }) => {
       const body = {
         title,
         ...(against_type ? { against_type } : {}),
@@ -57,26 +81,30 @@ export function buildServer(subject) {
         ...(notes ? { notes } : {}),
         ...(fields || {}),
       };
+      if (confirm !== true) return needsConfirmation('CREATE a new quote', body);
+      const token = await getValidAcceloToken(subject);
       return ok(await accelo.createQuote(token, body));
     }
   );
 
   server.tool(
     'update_quote',
-    'Update an existing Accelo quote by ID. Only the provided fields are changed.',
+    'Update an existing Accelo quote by ID. WRITE OPERATION: requires confirm:true. Call once without confirm to preview the change, show it to the user for approval, then call again with confirm:true. Only the provided fields are changed.',
     {
       id: z.string().describe('The quote ID to update'),
       title: z.string().optional().describe('New quote title'),
       notes: z.string().optional().describe('New quote notes / body'),
       fields: z.record(z.string()).optional().describe('Any additional Accelo quote fields as key/value pairs'),
+      confirm: z.boolean().optional().describe('Must be true to actually update the quote. Omit/false to preview only.'),
     },
-    async ({ id, title, notes, fields }) => {
-      const token = await getValidAcceloToken(subject);
+    async ({ id, title, notes, fields, confirm }) => {
       const body = {
         ...(title !== undefined ? { title } : {}),
         ...(notes !== undefined ? { notes } : {}),
         ...(fields || {}),
       };
+      if (confirm !== true) return needsConfirmation(`UPDATE quote ${id}`, { id, ...body });
+      const token = await getValidAcceloToken(subject);
       return ok(await accelo.updateQuote(token, id, body));
     }
   );

@@ -5,7 +5,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for
 clients (such as LibreChat agents) and authenticates **per user** via Accelo
 OAuth, so every action respects that user's own Accelo permissions.
 
-> Status: early. Tools: `list_quotes`, `get_quote`, `create_quote`, `update_quote`.
+> Status: early. Tools: `list_quotes`, `get_quote`, `get_deal`, `create_quote`, `update_quote`.
 
 ## How auth works
 
@@ -20,6 +20,32 @@ bounced to Accelo's consent screen; the resulting Accelo access/refresh tokens
 are stored locally (SQLite) keyed to an opaque subject, and the MCP client is
 handed one of *our* opaque tokens that maps back to it. Accelo tokens are
 refreshed automatically.
+
+## Quote fields
+
+`create_quote` and `update_quote` model every client-editable Accelo quote
+field explicitly, each mapping 1:1 to an Accelo quote key. Pick the field that
+matches the user's intent — **do not** route client-facing body text into
+`notes`.
+
+| Field | Client-facing? | Notes |
+| --- | --- | --- |
+| `title` | — | Quote title. Required on create. |
+| `affiliation_id` | — | Company/contact affiliation the quote is for. |
+| `manager_id` | — | Accelo staff member who owns/manages the quote. |
+| `date_expiry` | — | Expiry date as a Unix timestamp (seconds). |
+| `notes` | **No (INTERNAL)** | Internal notes only. **Never** put introduction/conclusion/terms text here. |
+| `introduction` | **Yes** | Introduction section shown at the top of the quote. |
+| `conclusion` | **Yes** | Conclusion section shown at the bottom of the quote. |
+| `terms_and_conditions` | **Yes** | Terms and conditions section. |
+| `client_portal_access` | **Yes** | Client portal access setting. |
+
+> History: earlier versions only surfaced `title` and `notes` as named params;
+> all other keys were reachable only through an unconstrained freeform `fields`
+> map. A request to set the **conclusion** therefore got silently written to
+> **`notes`** (Accelo accepts it, so no error was raised). These fields are now
+> modeled explicitly and the freeform passthrough was removed. See
+> `src/mcp.js` (`editableQuoteFields`).
 
 ## Prerequisites
 

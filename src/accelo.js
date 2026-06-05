@@ -4,11 +4,14 @@ const log = (...a) => console.log(new Date().toISOString(), '[accelo]', ...a);
 
 // Fields we request back from Accelo for quotes. Accelo hides most fields
 // unless explicitly requested via _fields, and omits null/empty fields from
-// responses.
+// responses. Includes the client-facing body sections (introduction,
+// conclusion, terms_and_conditions) so reads round-trip what writes can set.
 const QUOTE_FIELDS = [
   'id', 'title', 'against_type', 'against_id', 'affiliation_id', 'contact_id',
   'manager_id', 'standing', 'date_created', 'date_modified', 'date_issued',
-  'date_due', 'total', 'tax', 'subtotal', 'currency_id', 'notes',
+  'date_due', 'date_expiry', 'total', 'tax', 'subtotal', 'currency_id',
+  'notes', 'introduction', 'conclusion', 'terms_and_conditions',
+  'client_portal_access',
 ].join(',');
 
 async function acceloFetch(token, pathname, { method = 'GET', query, body } = {}) {

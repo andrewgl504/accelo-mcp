@@ -25,9 +25,12 @@ import { getValidAcceloToken } from './oauth.js';
 //   - Planned schedule = date_started / date_due. Actuals = date_commenced /
 //     date_completed. All dates are Unix timestamps (seconds). Accelo requires
 //     a start date to create a task.
-//   - DATE OFF-BY-ONE: a YYYY-MM-DD converted to MIDNIGHT UTC lands on the date
-//     boundary and Accelo's timezone handling can push it back a day. We convert
-//     to NOON UTC (12:00:00Z) so the calendar date survives storage + read-back.
+//   - TIMEZONE: Accelo anchors dates to the DEPLOYMENT timezone (US Central /
+//     New Orleans => America/Chicago). e.g. raw 1781456400 = 2026-06-15 00:00
+//     CDT. Reading that stamp in UTC yields 2026-06-15 05:00 -> slicing gave
+//     2026-06-14 (off-by-one). We therefore format reads in ACCELO_TIMEZONE and
+//     write a YYYY-MM-DD as NOON in ACCELO_TIMEZONE so it round-trips. Override
+//     via env ACCELO_TIMEZONE (default America/Chicago).
 //   - STATUS CHANGES REQUIRE PROGRESSIONS. Direct task_status writes via PUT are
 //     silently ignored by Accelo. Use list_task_progressions to discover the
 //     available progression IDs for a task, then progress_task to run one.
@@ -35,6 +38,8 @@ import { getValidAcceloToken } from './oauth.js';
 //     12 = Task for Third Party. Cancelling runs PROGRESSION 14 (-> status 6).
 
 const log = (...a) => console.log(new Date().toISOString(), '[projects]', ...a);
+
+const TZ = process.env.ACCELO_TIMEZONE || 'America/Chicago';
 
 const WAITING_STATUS = { '8': 'Task for Client', '12': 'Task for Third Party' };
 const STATUS_LABELS = { '6': 'Cancelled', '8': 'Task for Client', '12': 'Task for Third Party' };
@@ -152,23 +157,51 @@ async function runProgression(token, taskId, progressionId) {
   throw new Error(`Progression ${progressionId} on task ${taskId} failed. Tried: ${errors.join(' | ')}`);
 }
 
-function tsToISO(ts) {
-  const n = Number(ts);
-  return Number.isFinite(n) && n > 0 ? new Date(n * 1000).toISOString().slice(0, 10) : null;
+// ---------------------------------------------------------------------------
+// Timezone-aware date helpers (deployment TZ = ACCELO_TIMEZONE)
+// ---------------------------------------------------------------------------
+
+// Offset (ms) of TZ at a given UTC instant. Positive = ahead of UTC.
+function tzOffsetMs(utcMs, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const parts = dtf.formatToParts(new Date(utcMs));
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  let hour = map.hour === '24' ? '00' : map.hour;
+  const asUTC = Date.UTC(map.year, Number(map.month) - 1, map.day, hour, map.minute, map.second);
+  return asUTC - utcMs;
 }
 
-// Accept an ISO date (YYYY-MM-DD) or a raw Unix-seconds string/number and
-// return Unix seconds as a string. ISO dates map to NOON UTC (12:00:00Z) -- NOT
-// midnight -- so Accelo's timezone handling cannot shift the calendar date to
-// the previous day (the off-by-one bug found in live testing). Returns
-// undefined for empty input.
+// Format a Unix-seconds timestamp as a YYYY-MM-DD calendar date IN the
+// deployment timezone (so Accelo's TZ-anchored dates read back correctly).
+function tsToISO(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // en-CA renders as YYYY-MM-DD.
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(n * 1000));
+}
+
+// Convert a YYYY-MM-DD to Unix seconds at NOON in the deployment timezone. Noon
+// (not midnight) keeps the calendar date stable against any DST/boundary edge.
+// Also accepts raw 10-digit Unix seconds unchanged.
 function toUnixSeconds(input) {
   if (input === undefined || input === null || input === '') return undefined;
   const s = String(input).trim();
-  if (/^\d{10}$/.test(s)) return s;                 // already unix seconds
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {              // ISO date -> NOON UTC
-    const ms = Date.parse(s + 'T12:00:00Z');
-    if (!Number.isNaN(ms)) return String(Math.floor(ms / 1000));
+  if (/^\d{10}$/.test(s)) return s; // already unix seconds
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (m) {
+    const [, y, mo, d] = m;
+    // Guess noon UTC, then correct by the TZ offset at that instant so the
+    // wall-clock time is noon in TZ.
+    const noonUTC = Date.UTC(Number(y), Number(mo) - 1, Number(d), 12, 0, 0);
+    const offset = tzOffsetMs(noonUTC, TZ);
+    return String(Math.floor((noonUTC - offset) / 1000));
   }
   const ms = Date.parse(s);
   if (!Number.isNaN(ms)) return String(Math.floor(ms / 1000));
@@ -309,7 +342,7 @@ export function registerProjectTools(server, subject) {
   // -------- Reads --------
   server.tool(
     'get_project_plan',
-    'Get the full project plan for an Accelo job: the job, its milestones (ordered), the tasks under each milestone (ordered), any tasks attached directly to the job, and a waiting_summary of tasks currently waiting on a client or third party (native task_status 8/12). Dates are shown as ISO (YYYY-MM-DD) planned vs actual. Read-only.',
+    'Get the full project plan for an Accelo job: the job, its milestones (ordered), the tasks under each milestone (ordered), any tasks attached directly to the job, and a waiting_summary of tasks currently waiting on a client or third party (native task_status 8/12). Dates are shown as ISO (YYYY-MM-DD) planned vs actual, in the deployment timezone. Read-only.',
     { job_id: z.string().describe('The Accelo job (project) ID, e.g. "862"') },
     async ({ job_id }) => {
       const token = await getValidAcceloToken(subject);
@@ -337,7 +370,7 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'get_task',
-    'Get a single Accelo task by ID, with ISO planned/actual dates and a waiting_on flag (set when the task is waiting on a client or third party via task_status 8/12) and a cancelled flag (task_status 6). Read-only.',
+    'Get a single Accelo task by ID, with ISO planned/actual dates (deployment timezone) and a waiting_on flag (task_status 8/12) and a cancelled flag (task_status 6). Read-only.',
     { id: z.string().describe('The task ID') },
     async ({ id }) => {
       const token = await getValidAcceloToken(subject);
@@ -361,7 +394,7 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'update_task',
-    'Update a single Accelo task\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates accept YYYY-MM-DD. NOTE: this does NOT change task STATUS -- Accelo ignores direct status writes; use progress_task (or cancel_task) for status transitions. This is a single-task edit and does NOT cascade/shift other tasks.',
+    'Update a single Accelo task\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates accept YYYY-MM-DD (interpreted in the deployment timezone). NOTE: this does NOT change task STATUS -- Accelo ignores direct status writes; use progress_task (or cancel_task) for status transitions. This is a single-task edit and does NOT cascade/shift other tasks.',
     {
       id: z.string().describe('The task ID to update'),
       title: z.string().optional().describe('New task title'),
@@ -392,7 +425,7 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'create_task',
-    'Create a new Accelo task against a milestone OR a job. WRITE OPERATION: requires confirm:true. First call (no confirm) previews the payload; call again with confirm:true to create. Exactly one of milestone_id or job_id is required. Accelo REQUIRES a start date -- provide planned_start (YYYY-MM-DD). After creation the task is re-fetched so the response shows the true stored dates.',
+    'Create a new Accelo task against a milestone OR a job. WRITE OPERATION: requires confirm:true. First call (no confirm) previews the payload; call again with confirm:true to create. Exactly one of milestone_id or job_id is required. Accelo REQUIRES a start date -- provide planned_start (YYYY-MM-DD, deployment timezone). After creation the task is re-fetched so the response shows the true stored dates.',
     {
       title: z.string().describe('Task title'),
       milestone_id: z.string().optional().describe('Milestone ID to attach the task to'),
@@ -431,7 +464,7 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'update_milestone',
-    'Update a single Accelo milestone\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Single-object edit -- does NOT cascade to the milestone\'s tasks.',
+    'Update a single Accelo milestone\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates are interpreted in the deployment timezone. Single-object edit -- does NOT cascade to the milestone\'s tasks.',
     {
       id: z.string().describe('The milestone ID to update'),
       title: z.string().optional().describe('New milestone title'),

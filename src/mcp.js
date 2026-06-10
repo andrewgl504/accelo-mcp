@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import * as accelo from './accelo.js';
 import { getValidAcceloToken } from './oauth.js';
+import { registerProjectTools } from './projects.js';
 
 function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
@@ -144,6 +145,9 @@ export function buildServer(subject) {
       return ok(await accelo.updateQuote(token, id, body));
     }
   );
+
+  // Project-planning read tools (get_project_plan, list_tasks, get_task).
+  registerProjectTools(server, subject);
 
   return server;
 }

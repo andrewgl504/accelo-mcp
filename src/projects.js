@@ -4,9 +4,9 @@ import { getValidAcceloToken } from './oauth.js';
 
 // Project-planning module for the Accelo MCP.
 //
-// Phase 1 (read): get_project_plan, list_tasks, get_task.
-// Phase 2 (write): update_task, create_task, update_milestone, cancel_task.
-//   All writes are confirm:true-guarded and preview a before/after diff first.
+// Phase 1 (read): get_project_plan, list_tasks, get_task, list_task_progressions.
+// Phase 2 (write): update_task, create_task, update_milestone, progress_task,
+//   cancel_task. All writes are confirm:true-guarded and preview first.
 //
 // Kept deliberately self-contained (its own fetch helpers + MCP result helper)
 // so it does not collide with concurrent edits to accelo.js / mcp.js. The only
@@ -23,18 +23,23 @@ import { getValidAcceloToken } from './oauth.js';
 //     GUI engine (future Playwright phase). These write tools are single-object
 //     only -- they do NOT cascade downstream tasks.
 //   - Planned schedule = date_started / date_due. Actuals = date_commenced /
-//     date_completed. All dates are Unix timestamps (seconds).
-//   - Task deletion is NOT supported by the Accelo REST API. "Cancelling" a
-//     task is therefore modeled as a status change to the deployment's inactive
-//     status (task_status 15), which is reversible and visible in the GUI.
-//   - Relevant task_status IDs in this deployment: 8 = Task for Client,
-//     12 = Task for Third Party, 15 = Cancelled/Inactive.
+//     date_completed. All dates are Unix timestamps (seconds). Accelo requires
+//     a start date to create a task.
+//   - DATE OFF-BY-ONE: a YYYY-MM-DD converted to MIDNIGHT UTC lands on the date
+//     boundary and Accelo's timezone handling can push it back a day. We convert
+//     to NOON UTC (12:00:00Z) so the calendar date survives storage + read-back.
+//   - STATUS CHANGES REQUIRE PROGRESSIONS. Direct task_status writes via PUT are
+//     silently ignored by Accelo. Use list_task_progressions to discover the
+//     available progression IDs for a task, then progress_task to run one.
+//   - Known status IDs in this deployment: 6 = Cancelled, 8 = Task for Client,
+//     12 = Task for Third Party. Cancelling runs PROGRESSION 14 (-> status 6).
 
 const log = (...a) => console.log(new Date().toISOString(), '[projects]', ...a);
 
 const WAITING_STATUS = { '8': 'Task for Client', '12': 'Task for Third Party' };
-const STATUS_LABELS = { '8': 'Task for Client', '12': 'Task for Third Party', '15': 'Cancelled/Inactive' };
-const CANCELLED_STATUS = '15';
+const STATUS_LABELS = { '6': 'Cancelled', '8': 'Task for Client', '12': 'Task for Third Party' };
+const CANCELLED_STATUS = '6';
+const CANCEL_PROGRESSION_ID = '14';
 
 const JOB_FIELDS = [
   'id', 'title', 'standing', 'job_status', 'manager', 'against', 'against_type',
@@ -112,19 +117,57 @@ async function acceloWrite(token, method, pathname, body) {
   return json;
 }
 
+// Non-throwing POST used for progression attempts (we try multiple shapes).
+async function acceloTryPost(token, pathname, body) {
+  const url = new URL(config.acceloBaseUrl + pathname);
+  const opts = {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  };
+  if (body && Object.keys(body).length) {
+    opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    opts.body = new URLSearchParams(body).toString();
+  }
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  return { ok: res.ok, status: res.status, json, message: (json && json.meta && json.meta.message) || text };
+}
+
+// Run a task progression. Accelo deployments differ on the exact endpoint
+// shape, so we try the plain progression endpoint then the /auto variant and
+// return whichever succeeds (or a combined error if both fail).
+async function runProgression(token, taskId, progressionId) {
+  const candidates = [
+    `/tasks/${encodeURIComponent(taskId)}/progressions/${encodeURIComponent(progressionId)}`,
+    `/tasks/${encodeURIComponent(taskId)}/progressions/${encodeURIComponent(progressionId)}/auto`,
+  ];
+  const errors = [];
+  for (const p of candidates) {
+    const r = await acceloTryPost(token, p, {});
+    if (r.ok) return { path: p, response: r.json };
+    errors.push(`${p} -> ${r.status} ${r.message}`);
+  }
+  throw new Error(`Progression ${progressionId} on task ${taskId} failed. Tried: ${errors.join(' | ')}`);
+}
+
 function tsToISO(ts) {
   const n = Number(ts);
   return Number.isFinite(n) && n > 0 ? new Date(n * 1000).toISOString().slice(0, 10) : null;
 }
 
 // Accept an ISO date (YYYY-MM-DD) or a raw Unix-seconds string/number and
-// return Unix seconds as a string. Returns undefined for empty input.
+// return Unix seconds as a string. ISO dates map to NOON UTC (12:00:00Z) -- NOT
+// midnight -- so Accelo's timezone handling cannot shift the calendar date to
+// the previous day (the off-by-one bug found in live testing). Returns
+// undefined for empty input.
 function toUnixSeconds(input) {
   if (input === undefined || input === null || input === '') return undefined;
   const s = String(input).trim();
   if (/^\d{10}$/.test(s)) return s;                 // already unix seconds
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {              // ISO date -> midnight UTC
-    const ms = Date.parse(s + 'T00:00:00Z');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {              // ISO date -> NOON UTC
+    const ms = Date.parse(s + 'T12:00:00Z');
     if (!Number.isNaN(ms)) return String(Math.floor(ms / 1000));
   }
   const ms = Date.parse(s);
@@ -181,6 +224,11 @@ function decorateMilestone(m) {
   };
 }
 
+async function getTask(token, id) {
+  const json = await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS });
+  return json.response || null;
+}
+
 async function fetchTasksAgainst(token, type, id) {
   const json = await acceloGet(token, '/tasks', {
     _filters: `against(${type}(${id}))`,
@@ -233,22 +281,15 @@ async function getProjectPlan(token, jobId) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2 write helpers
+// Diff helpers
 // ---------------------------------------------------------------------------
 
-// Build a {field: {from, to}} diff for the fields being changed on a task,
-// translating planned date timestamps to ISO for human review.
 function buildTaskDiff(current, body) {
   const diff = {};
   const isoFields = { date_started: 'planned_start', date_due: 'planned_due' };
   for (const [k, to] of Object.entries(body)) {
-    if (isoFields[k]) {
-      diff[isoFields[k]] = { from: tsToISO(current[k]), to: tsToISO(to) };
-    } else if (k === 'task_status') {
-      diff.task_status = { from: statusLabel(current.task_status), to: statusLabel(to) };
-    } else {
-      diff[k] = { from: current[k], to };
-    }
+    if (isoFields[k]) diff[isoFields[k]] = { from: tsToISO(current[k]), to: tsToISO(to) };
+    else diff[k] = { from: current[k], to };
   }
   return diff;
 }
@@ -265,7 +306,7 @@ function buildMilestoneDiff(current, body) {
 
 // Register all project tools (read + write) onto an existing McpServer.
 export function registerProjectTools(server, subject) {
-  // -------- Phase 1 reads --------
+  // -------- Reads --------
   server.tool(
     'get_project_plan',
     'Get the full project plan for an Accelo job: the job, its milestones (ordered), the tasks under each milestone (ordered), any tasks attached directly to the job, and a waiting_summary of tasks currently waiting on a client or third party (native task_status 8/12). Dates are shown as ISO (YYYY-MM-DD) planned vs actual. Read-only.',
@@ -296,61 +337,72 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'get_task',
-    'Get a single Accelo task by ID, with ISO planned/actual dates and a waiting_on flag (set when the task is waiting on a client or third party via native task_status 8/12). Read-only.',
+    'Get a single Accelo task by ID, with ISO planned/actual dates and a waiting_on flag (set when the task is waiting on a client or third party via task_status 8/12) and a cancelled flag (task_status 6). Read-only.',
     { id: z.string().describe('The task ID') },
     async ({ id }) => {
       const token = await getValidAcceloToken(subject);
-      const json = await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS });
-      return ok(json.response ? decorateTask(json.response) : { status: 'error', message: 'Task not found' });
+      const t = await getTask(token, id);
+      return ok(t ? decorateTask(t) : { status: 'error', message: 'Task not found' });
     }
   );
 
-  // -------- Phase 2 writes (confirm:true-guarded; single-object, no cascade) --------
+  server.tool(
+    'list_task_progressions',
+    'List the progressions available for a task. In Accelo, a task\'s status cannot be set directly via update -- you must run a PROGRESSION, which transitions the task to a new status. Use this to discover the available progression IDs and the status each leads to, then call progress_task. Read-only.',
+    { task_id: z.string().describe('The task ID to list progressions for') },
+    async ({ task_id }) => {
+      const token = await getValidAcceloToken(subject);
+      const json = await acceloGet(token, `/tasks/${encodeURIComponent(task_id)}/progressions`, { _fields: '_ALL', _limit: 100 });
+      return ok(json.response || []);
+    }
+  );
+
+  // -------- Writes (confirm:true-guarded; single-object, no cascade) --------
 
   server.tool(
     'update_task',
-    'Update a single Accelo task. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff to review with the user; call again with confirm:true to apply. Only the provided fields change. NOTE: this is a single-task edit and does NOT cascade/shift any other tasks. task_status reference for this deployment: 8 = Task for Client (waiting), 12 = Task for Third Party (waiting), 15 = Cancelled/Inactive (use cancel_task for that).',
+    'Update a single Accelo task\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates accept YYYY-MM-DD. NOTE: this does NOT change task STATUS -- Accelo ignores direct status writes; use progress_task (or cancel_task) for status transitions. This is a single-task edit and does NOT cascade/shift other tasks.',
     {
       id: z.string().describe('The task ID to update'),
       title: z.string().optional().describe('New task title'),
       planned_start: z.string().optional().describe('New planned start date as YYYY-MM-DD (or Unix seconds)'),
       planned_due: z.string().optional().describe('New planned due date as YYYY-MM-DD (or Unix seconds)'),
-      task_status: z.string().optional().describe('New task_status ID. 8 = Task for Client (waiting), 12 = Task for Third Party (waiting), 15 = Cancelled/Inactive.'),
       confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the diff only.'),
     },
-    async ({ id, title, planned_start, planned_due, task_status, confirm }) => {
+    async ({ id, title, planned_start, planned_due, confirm }) => {
       const token = await getValidAcceloToken(subject);
       const body = {};
       if (title !== undefined) body.title = title;
       if (planned_start !== undefined) body.date_started = toUnixSeconds(planned_start);
       if (planned_due !== undefined) body.date_due = toUnixSeconds(planned_due);
-      if (task_status !== undefined) body.task_status = task_status;
       if (Object.keys(body).length === 0) {
-        return ok({ status: 'error', message: 'No updatable fields provided.' });
+        return ok({ status: 'error', message: 'No updatable fields provided (title, planned_start, planned_due).' });
       }
-      const current = (await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS })).response;
+      const current = await getTask(token, id);
       if (!current) return ok({ status: 'error', message: `Task ${id} not found.` });
       const diff = buildTaskDiff(current, body);
       if (confirm !== true) return needsConfirmation(`UPDATE task ${id} ("${current.title}")`, diff);
-      const res = await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, body);
-      return ok({ status: 'updated', task: res.response ? decorateTask(res.response) : res.response, applied: diff });
+      await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, body);
+      // Re-GET so the response reflects the true stored dates (the write
+      // response can omit/return null for date fields).
+      const after = await getTask(token, id);
+      return ok({ status: 'updated', task: after ? decorateTask(after) : null, applied: diff });
     }
   );
 
   server.tool(
     'create_task',
-    'Create a new Accelo task against a milestone OR a job. WRITE OPERATION: requires confirm:true. First call (no confirm) previews the payload; call again with confirm:true to create. Exactly one of milestone_id or job_id is required. Accelo may require planned dates and/or an assignee depending on deployment; if creation fails, the Accelo error is returned.',
+    'Create a new Accelo task against a milestone OR a job. WRITE OPERATION: requires confirm:true. First call (no confirm) previews the payload; call again with confirm:true to create. Exactly one of milestone_id or job_id is required. Accelo REQUIRES a start date -- provide planned_start (YYYY-MM-DD). After creation the task is re-fetched so the response shows the true stored dates.',
     {
       title: z.string().describe('Task title'),
       milestone_id: z.string().optional().describe('Milestone ID to attach the task to'),
       job_id: z.string().optional().describe('Job ID to attach the task directly to (when not under a milestone)'),
-      planned_start: z.string().optional().describe('Planned start date as YYYY-MM-DD (or Unix seconds)'),
+      planned_start: z.string().describe('Planned start date as YYYY-MM-DD (REQUIRED by Accelo)'),
       planned_due: z.string().optional().describe('Planned due date as YYYY-MM-DD (or Unix seconds)'),
       assignee_id: z.string().optional().describe('Staff ID to assign the task to'),
-      task_status: z.string().optional().describe('Initial task_status ID (e.g. 8 = Task for Client, 12 = Task for Third Party)'),
       confirm: z.boolean().optional().describe('Must be true to create. Omit/false to preview only.'),
     },
-    async ({ title, milestone_id, job_id, planned_start, planned_due, assignee_id, task_status, confirm }) => {
+    async ({ title, milestone_id, job_id, planned_start, planned_due, assignee_id, confirm }) => {
       if (!milestone_id && !job_id) return ok({ status: 'error', message: 'Provide either milestone_id or job_id.' });
       if (milestone_id && job_id) return ok({ status: 'error', message: 'Provide only one of milestone_id or job_id.' });
       const token = await getValidAcceloToken(subject);
@@ -358,27 +410,28 @@ export function registerProjectTools(server, subject) {
         title,
         against_type: milestone_id ? 'milestone' : 'job',
         against_id: milestone_id || job_id,
+        date_started: toUnixSeconds(planned_start),
       };
-      if (planned_start !== undefined) body.date_started = toUnixSeconds(planned_start);
       if (planned_due !== undefined) body.date_due = toUnixSeconds(planned_due);
       if (assignee_id !== undefined) body.assignee = assignee_id;
-      if (task_status !== undefined) body.task_status = task_status;
       const preview = {
         title,
         against: `${body.against_type}(${body.against_id})`,
-        planned_start: planned_start ? tsToISO(body.date_started) : undefined,
+        planned_start: tsToISO(body.date_started),
         planned_due: planned_due ? tsToISO(body.date_due) : undefined,
-        assignee_id, task_status,
+        assignee_id,
       };
       if (confirm !== true) return needsConfirmation('CREATE a new task', preview);
       const res = await acceloWrite(token, 'POST', '/tasks', body);
-      return ok({ status: 'created', task: res.response ? decorateTask(res.response) : res.response });
+      const newId = res.response && res.response.id;
+      const after = newId ? await getTask(token, newId) : res.response;
+      return ok({ status: 'created', task: after ? decorateTask(after) : res.response });
     }
   );
 
   server.tool(
     'update_milestone',
-    'Update a single Accelo milestone. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Single-object edit -- does NOT cascade to the milestone\'s tasks.',
+    'Update a single Accelo milestone\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Single-object edit -- does NOT cascade to the milestone\'s tasks.',
     {
       id: z.string().describe('The milestone ID to update'),
       title: z.string().optional().describe('New milestone title'),
@@ -397,30 +450,63 @@ export function registerProjectTools(server, subject) {
       if (!current) return ok({ status: 'error', message: `Milestone ${id} not found.` });
       const diff = buildMilestoneDiff(current, body);
       if (confirm !== true) return needsConfirmation(`UPDATE milestone ${id} ("${current.title}")`, diff);
-      const res = await acceloWrite(token, 'PUT', `/milestones/${encodeURIComponent(id)}`, body);
-      return ok({ status: 'updated', milestone: res.response ? decorateMilestone(res.response) : res.response, applied: diff });
+      await acceloWrite(token, 'PUT', `/milestones/${encodeURIComponent(id)}`, body);
+      const after = (await acceloGet(token, `/milestones/${encodeURIComponent(id)}`, { _fields: MILESTONE_FIELDS })).response;
+      return ok({ status: 'updated', milestone: after ? decorateMilestone(after) : null, applied: diff });
+    }
+  );
+
+  server.tool(
+    'progress_task',
+    'Run a task PROGRESSION to transition its status. WRITE OPERATION: requires confirm:true. In Accelo, task status is changed via progressions, not direct writes. Use list_task_progressions to find the progression_id that leads to the status you want, then run it here. Tries the standard and /auto endpoint shapes automatically.',
+    {
+      task_id: z.string().describe('The task ID to progress'),
+      progression_id: z.string().describe('The progression ID to run (from list_task_progressions)'),
+      confirm: z.boolean().optional().describe('Must be true to run. Omit/false to preview only.'),
+    },
+    async ({ task_id, progression_id, confirm }) => {
+      const token = await getValidAcceloToken(subject);
+      const current = await getTask(token, task_id);
+      if (!current) return ok({ status: 'error', message: `Task ${task_id} not found.` });
+      if (confirm !== true) {
+        return needsConfirmation(`RUN progression ${progression_id} on task ${task_id} ("${current.title}")`, {
+          task: `${task_id} ("${current.title}")`,
+          current_status: statusLabel(current.task_status),
+          progression_id,
+        });
+      }
+      const result = await runProgression(token, task_id, progression_id);
+      const after = await getTask(token, task_id);
+      return ok({ status: 'progressed', via: result.path, task: after ? decorateTask(after) : null });
     }
   );
 
   server.tool(
     'cancel_task',
-    'Cancel an Accelo task by setting it to the inactive status (task_status 15). WRITE OPERATION: requires confirm:true. The Accelo REST API does NOT support deleting tasks, so cancellation is a reversible status change (not a delete) that is visible in the Accelo GUI; reactivate later via update_task with a normal status. Optionally prepends a visible marker to the title so a human can spot it. First call (no confirm) returns a before/after diff; call again with confirm:true to apply.',
+    'Cancel an Accelo task by running the cancel progression (progression 14 -> status 6 Cancelled). WRITE OPERATION: requires confirm:true. Accelo does not support deleting tasks; cancelling is a reversible status transition visible in the GUI. Optionally prepends "[CANCELLED] " to the title (via a separate update) so it is obvious in the GUI. First call (no confirm) previews; call again with confirm:true to apply.',
     {
       id: z.string().describe('The task ID to cancel'),
-      mark_title: z.boolean().optional().describe('If true, prepend "[CANCELLED] " to the task title so it is obvious in the GUI. Default false.'),
-      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the diff only.'),
+      mark_title: z.boolean().optional().describe('If true, prepend "[CANCELLED] " to the task title. Default false.'),
+      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview only.'),
     },
     async ({ id, mark_title, confirm }) => {
       const token = await getValidAcceloToken(subject);
-      const current = (await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS })).response;
+      const current = await getTask(token, id);
       if (!current) return ok({ status: 'error', message: `Task ${id} not found.` });
-      const body = { task_status: CANCELLED_STATUS };
       const alreadyMarked = String(current.title || '').startsWith('[CANCELLED] ');
-      if (mark_title && !alreadyMarked) body.title = `[CANCELLED] ${current.title}`;
-      const diff = buildTaskDiff(current, body);
-      if (confirm !== true) return needsConfirmation(`CANCEL task ${id} ("${current.title}") by setting it inactive (status 15)`, diff);
-      const res = await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, body);
-      return ok({ status: 'cancelled', task: res.response ? decorateTask(res.response) : res.response, applied: diff });
+      const newTitle = mark_title && !alreadyMarked ? `[CANCELLED] ${current.title}` : undefined;
+      if (confirm !== true) {
+        return needsConfirmation(`CANCEL task ${id} ("${current.title}")`, {
+          task: `${id} ("${current.title}")`,
+          action: `Run progression ${CANCEL_PROGRESSION_ID} -> status ${CANCELLED_STATUS} (Cancelled)`,
+          current_status: statusLabel(current.task_status),
+          title_change: newTitle ? { from: current.title, to: newTitle } : undefined,
+        });
+      }
+      if (newTitle) await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, { title: newTitle });
+      const result = await runProgression(token, id, CANCEL_PROGRESSION_ID);
+      const after = await getTask(token, id);
+      return ok({ status: 'cancelled', via: result.path, task: after ? decorateTask(after) : null });
     }
   );
 }

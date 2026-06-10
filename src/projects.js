@@ -2,10 +2,13 @@ import { z } from 'zod';
 import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
 
-// Phase 1 of the project-planning module: READ-ONLY tools that give an agent
-// visibility into an Accelo project plan (job -> milestones -> tasks).
+// Project-planning module for the Accelo MCP.
 //
-// Kept deliberately self-contained (its own fetch helper + MCP result helper)
+// Phase 1 (read): get_project_plan, list_tasks, get_task.
+// Phase 2 (write): update_task, create_task, update_milestone, delete_task.
+//   All writes are confirm:true-guarded and preview a before/after diff first.
+//
+// Kept deliberately self-contained (its own fetch helpers + MCP result helper)
 // so it does not collide with concurrent edits to accelo.js / mcp.js. The only
 // touch-point in mcp.js is a single registerProjectTools(server, subject) call.
 //
@@ -17,7 +20,8 @@ import { getValidAcceloToken } from './oauth.js';
 //   - There are NO dependency fields in the REST API. `ordering` is only the
 //     display row within a milestone/job and is mostly-but-not-always linear;
 //     it is NOT a dependency model. Authoritative cascades require Accelo's
-//     GUI engine (future Playwright phase).
+//     GUI engine (future Playwright phase). These write tools are single-object
+//     only -- they do NOT cascade downstream tasks.
 //   - Planned schedule = date_started / date_due. Actuals = date_commenced /
 //     date_completed. All dates are Unix timestamps (seconds).
 //   - "Waiting on external party" is a native task_status: 8 = Task for Client,
@@ -48,6 +52,17 @@ function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
 }
 
+// Human-in-the-loop guard: returned when a write tool is called without
+// confirm:true. Includes a before/after diff so the agent can show the user
+// exactly what will change before re-calling with confirm:true.
+function needsConfirmation(action, diff) {
+  return ok({
+    status: 'confirmation_required',
+    message: `This will ${action} in Accelo. Review the change below with the user, then call this tool again with confirm: true to proceed.`,
+    change: diff,
+  });
+}
+
 async function acceloGet(token, pathname, query) {
   const url = new URL(config.acceloBaseUrl + pathname);
   if (query) {
@@ -63,8 +78,31 @@ async function acceloGet(token, pathname, query) {
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) {
     const msg = (json && json.meta && json.meta.message) || text;
-    log('ERROR', pathname, res.status, '-', msg);
+    log('ERROR GET', pathname, res.status, '-', msg);
     throw new Error(`Accelo API GET ${pathname} failed: ${res.status} ${msg}`);
+  }
+  return json;
+}
+
+// Write helper for POST/PUT/DELETE. Body is form-urlencoded (Accelo's format).
+async function acceloWrite(token, method, pathname, body) {
+  const url = new URL(config.acceloBaseUrl + pathname);
+  const opts = {
+    method,
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  };
+  if (body && Object.keys(body).length) {
+    opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    opts.body = new URLSearchParams(body).toString();
+  }
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) {
+    const msg = (json && json.meta && json.meta.message) || text;
+    log('ERROR', method, pathname, res.status, '-', msg);
+    throw new Error(`Accelo API ${method} ${pathname} failed: ${res.status} ${msg}`);
   }
   return json;
 }
@@ -72,6 +110,21 @@ async function acceloGet(token, pathname, query) {
 function tsToISO(ts) {
   const n = Number(ts);
   return Number.isFinite(n) && n > 0 ? new Date(n * 1000).toISOString().slice(0, 10) : null;
+}
+
+// Accept an ISO date (YYYY-MM-DD) or a raw Unix-seconds string/number and
+// return Unix seconds as a string. Returns undefined for empty input.
+function toUnixSeconds(input) {
+  if (input === undefined || input === null || input === '') return undefined;
+  const s = String(input).trim();
+  if (/^\d{10}$/.test(s)) return s;                 // already unix seconds
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {              // ISO date -> midnight UTC
+    const ms = Date.parse(s + 'T00:00:00Z');
+    if (!Number.isNaN(ms)) return String(Math.floor(ms / 1000));
+  }
+  const ms = Date.parse(s);
+  if (!Number.isNaN(ms)) return String(Math.floor(ms / 1000));
+  throw new Error(`Unrecognized date: "${input}". Use YYYY-MM-DD or Unix seconds.`);
 }
 
 function byOrdering(a, b) {
@@ -142,10 +195,8 @@ async function getProjectPlan(token, jobId) {
     milestoneNodes.push({ ...decorateMilestone(m), tasks });
   }
 
-  // Tasks attached directly to the job (no milestone).
   const jobTasks = await fetchTasksAgainst(token, 'job', jobId);
 
-  // Roll up everything the team is waiting on (native status 8 / 12).
   const waiting = [];
   for (const mn of milestoneNodes) {
     for (const t of mn.tasks) {
@@ -171,8 +222,43 @@ async function getProjectPlan(token, jobId) {
   };
 }
 
-// Register the read-only project tools onto an existing McpServer instance.
+// ---------------------------------------------------------------------------
+// Phase 2 write helpers
+// ---------------------------------------------------------------------------
+
+// Build a {field: {from, to}} diff for the fields being changed on a task,
+// translating planned date timestamps to ISO for human review.
+function buildTaskDiff(current, body) {
+  const diff = {};
+  const isoFields = { date_started: 'planned_start', date_due: 'planned_due' };
+  for (const [k, to] of Object.entries(body)) {
+    if (isoFields[k]) {
+      diff[isoFields[k]] = { from: tsToISO(current[k]), to: tsToISO(to) };
+    } else if (k === 'task_status') {
+      diff.task_status = {
+        from: `${current.task_status}${WAITING_STATUS[String(current.task_status)] ? ' (' + WAITING_STATUS[String(current.task_status)] + ')' : ''}`,
+        to: `${to}${WAITING_STATUS[String(to)] ? ' (' + WAITING_STATUS[String(to)] + ')' : ''}`,
+      };
+    } else {
+      diff[k] = { from: current[k], to };
+    }
+  }
+  return diff;
+}
+
+function buildMilestoneDiff(current, body) {
+  const diff = {};
+  const isoFields = { date_started: 'planned_start', date_due: 'planned_due' };
+  for (const [k, to] of Object.entries(body)) {
+    if (isoFields[k]) diff[isoFields[k]] = { from: tsToISO(current[k]), to: tsToISO(to) };
+    else diff[k] = { from: current[k], to };
+  }
+  return diff;
+}
+
+// Register all project tools (read + write) onto an existing McpServer.
 export function registerProjectTools(server, subject) {
+  // -------- Phase 1 reads --------
   server.tool(
     'get_project_plan',
     'Get the full project plan for an Accelo job: the job, its milestones (ordered), the tasks under each milestone (ordered), any tasks attached directly to the job, and a waiting_summary of tasks currently waiting on a client or third party (native task_status 8/12). Dates are shown as ISO (YYYY-MM-DD) planned vs actual. Read-only.',
@@ -209,6 +295,122 @@ export function registerProjectTools(server, subject) {
       const token = await getValidAcceloToken(subject);
       const json = await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS });
       return ok(json.response ? decorateTask(json.response) : { status: 'error', message: 'Task not found' });
+    }
+  );
+
+  // -------- Phase 2 writes (confirm:true-guarded; single-object, no cascade) --------
+
+  server.tool(
+    'update_task',
+    'Update a single Accelo task. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff to review with the user; call again with confirm:true to apply. Only the provided fields change. NOTE: this is a single-task edit and does NOT cascade/shift any other tasks. To mark a task as waiting on an external party use task_status 8 (Task for Client) or 12 (Task for Third Party).',
+    {
+      id: z.string().describe('The task ID to update'),
+      title: z.string().optional().describe('New task title'),
+      planned_start: z.string().optional().describe('New planned start date as YYYY-MM-DD (or Unix seconds)'),
+      planned_due: z.string().optional().describe('New planned due date as YYYY-MM-DD (or Unix seconds)'),
+      task_status: z.string().optional().describe('New task_status ID. 8 = Task for Client (waiting), 12 = Task for Third Party (waiting).'),
+      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the diff only.'),
+    },
+    async ({ id, title, planned_start, planned_due, task_status, confirm }) => {
+      const token = await getValidAcceloToken(subject);
+      const body = {};
+      if (title !== undefined) body.title = title;
+      if (planned_start !== undefined) body.date_started = toUnixSeconds(planned_start);
+      if (planned_due !== undefined) body.date_due = toUnixSeconds(planned_due);
+      if (task_status !== undefined) body.task_status = task_status;
+      if (Object.keys(body).length === 0) {
+        return ok({ status: 'error', message: 'No updatable fields provided.' });
+      }
+      const current = (await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS })).response;
+      if (!current) return ok({ status: 'error', message: `Task ${id} not found.` });
+      const diff = buildTaskDiff(current, body);
+      if (confirm !== true) return needsConfirmation(`UPDATE task ${id} ("${current.title}")`, diff);
+      const res = await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, body);
+      return ok({ status: 'updated', task: res.response ? decorateTask(res.response) : res.response, applied: diff });
+    }
+  );
+
+  server.tool(
+    'create_task',
+    'Create a new Accelo task against a milestone OR a job. WRITE OPERATION: requires confirm:true. First call (no confirm) previews the payload; call again with confirm:true to create. Exactly one of milestone_id or job_id is required. Accelo may require planned dates and/or an assignee depending on deployment; if creation fails, the Accelo error is returned.',
+    {
+      title: z.string().describe('Task title'),
+      milestone_id: z.string().optional().describe('Milestone ID to attach the task to'),
+      job_id: z.string().optional().describe('Job ID to attach the task directly to (when not under a milestone)'),
+      planned_start: z.string().optional().describe('Planned start date as YYYY-MM-DD (or Unix seconds)'),
+      planned_due: z.string().optional().describe('Planned due date as YYYY-MM-DD (or Unix seconds)'),
+      assignee_id: z.string().optional().describe('Staff ID to assign the task to'),
+      task_status: z.string().optional().describe('Initial task_status ID (e.g. 8 = Task for Client, 12 = Task for Third Party)'),
+      confirm: z.boolean().optional().describe('Must be true to create. Omit/false to preview only.'),
+    },
+    async ({ title, milestone_id, job_id, planned_start, planned_due, assignee_id, task_status, confirm }) => {
+      if (!milestone_id && !job_id) return ok({ status: 'error', message: 'Provide either milestone_id or job_id.' });
+      if (milestone_id && job_id) return ok({ status: 'error', message: 'Provide only one of milestone_id or job_id.' });
+      const token = await getValidAcceloToken(subject);
+      const body = {
+        title,
+        against_type: milestone_id ? 'milestone' : 'job',
+        against_id: milestone_id || job_id,
+      };
+      if (planned_start !== undefined) body.date_started = toUnixSeconds(planned_start);
+      if (planned_due !== undefined) body.date_due = toUnixSeconds(planned_due);
+      if (assignee_id !== undefined) body.assignee = assignee_id;
+      if (task_status !== undefined) body.task_status = task_status;
+      const preview = {
+        title,
+        against: `${body.against_type}(${body.against_id})`,
+        planned_start: planned_start ? tsToISO(body.date_started) : undefined,
+        planned_due: planned_due ? tsToISO(body.date_due) : undefined,
+        assignee_id, task_status,
+      };
+      if (confirm !== true) return needsConfirmation('CREATE a new task', preview);
+      const res = await acceloWrite(token, 'POST', '/tasks', body);
+      return ok({ status: 'created', task: res.response ? decorateTask(res.response) : res.response });
+    }
+  );
+
+  server.tool(
+    'update_milestone',
+    'Update a single Accelo milestone. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Single-object edit -- does NOT cascade to the milestone\'s tasks.',
+    {
+      id: z.string().describe('The milestone ID to update'),
+      title: z.string().optional().describe('New milestone title'),
+      planned_start: z.string().optional().describe('New planned start date as YYYY-MM-DD (or Unix seconds)'),
+      planned_due: z.string().optional().describe('New planned due date as YYYY-MM-DD (or Unix seconds)'),
+      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the diff only.'),
+    },
+    async ({ id, title, planned_start, planned_due, confirm }) => {
+      const token = await getValidAcceloToken(subject);
+      const body = {};
+      if (title !== undefined) body.title = title;
+      if (planned_start !== undefined) body.date_started = toUnixSeconds(planned_start);
+      if (planned_due !== undefined) body.date_due = toUnixSeconds(planned_due);
+      if (Object.keys(body).length === 0) return ok({ status: 'error', message: 'No updatable fields provided.' });
+      const current = (await acceloGet(token, `/milestones/${encodeURIComponent(id)}`, { _fields: MILESTONE_FIELDS })).response;
+      if (!current) return ok({ status: 'error', message: `Milestone ${id} not found.` });
+      const diff = buildMilestoneDiff(current, body);
+      if (confirm !== true) return needsConfirmation(`UPDATE milestone ${id} ("${current.title}")`, diff);
+      const res = await acceloWrite(token, 'PUT', `/milestones/${encodeURIComponent(id)}`, body);
+      return ok({ status: 'updated', milestone: res.response ? decorateMilestone(res.response) : res.response, applied: diff });
+    }
+  );
+
+  server.tool(
+    'delete_task',
+    'Delete an Accelo task by ID. WRITE OPERATION: requires confirm:true. First call (no confirm) shows what will be deleted; call again with confirm:true to delete. NOTE: the Accelo REST API may not support task deletion; if it returns an error, delete the task in the Accelo GUI or mark it cancelled/complete instead.',
+    {
+      id: z.string().describe('The task ID to delete'),
+      confirm: z.boolean().optional().describe('Must be true to delete. Omit/false to preview only.'),
+    },
+    async ({ id, confirm }) => {
+      const token = await getValidAcceloToken(subject);
+      const current = (await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS })).response;
+      if (!current) return ok({ status: 'error', message: `Task ${id} not found.` });
+      if (confirm !== true) {
+        return needsConfirmation(`DELETE task ${id} ("${current.title}")`, { delete: { id, title: current.title } });
+      }
+      const res = await acceloWrite(token, 'DELETE', `/tasks/${encodeURIComponent(id)}`);
+      return ok({ status: 'deleted', id, response: res.meta || res });
     }
   );
 }

@@ -6,7 +6,8 @@ import { getValidAcceloToken } from './oauth.js';
 //
 // Phase 1 (read): get_project_plan, list_tasks, get_task, list_task_progressions.
 // Phase 2 (write): update_task, create_task, update_milestone, progress_task,
-//   cancel_task. All writes are confirm:true-guarded and preview first.
+//   cancel_task, reschedule_plan (bulk). All writes are confirm:true-guarded
+//   and preview first.
 //
 // Kept deliberately self-contained (its own fetch helpers + MCP result helper)
 // so it does not collide with concurrent edits to accelo.js / mcp.js. The only
@@ -36,6 +37,10 @@ import { getValidAcceloToken } from './oauth.js';
 //     available progression IDs for a task, then progress_task to run one.
 //   - Known status IDs in this deployment: 6 = Cancelled, 8 = Task for Client,
 //     12 = Task for Third Party. Cancelling runs PROGRESSION 14 (-> status 6).
+//   - CONCURRENCY: firing many parallel write tools overwhelms the container
+//     (each update = 3 Accelo calls) and stampedes token refresh. For multi-item
+//     changes use reschedule_plan, which processes everything SEQUENTIALLY in a
+//     single call.
 
 const log = (...a) => console.log(new Date().toISOString(), '[projects]', ...a);
 
@@ -337,6 +342,15 @@ function buildMilestoneDiff(current, body) {
   return diff;
 }
 
+// Build the {date_started?, date_due?, title?} write body from a plan item.
+function planItemBody(item) {
+  const body = {};
+  if (item.title !== undefined) body.title = item.title;
+  if (item.planned_start !== undefined) body.date_started = toUnixSeconds(item.planned_start);
+  if (item.planned_due !== undefined) body.date_due = toUnixSeconds(item.planned_due);
+  return body;
+}
+
 // Register all project tools (read + write) onto an existing McpServer.
 export function registerProjectTools(server, subject) {
   // -------- Reads --------
@@ -394,7 +408,7 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'update_task',
-    'Update a single Accelo task\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates accept YYYY-MM-DD (interpreted in the deployment timezone). NOTE: this does NOT change task STATUS -- Accelo ignores direct status writes; use progress_task (or cancel_task) for status transitions. This is a single-task edit and does NOT cascade/shift other tasks.',
+    'Update a single Accelo task\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates accept YYYY-MM-DD (interpreted in the deployment timezone). NOTE: this does NOT change task STATUS -- Accelo ignores direct status writes; use progress_task (or cancel_task) for status transitions. Single-task edit -- does NOT cascade. To change MANY tasks at once, use reschedule_plan (do NOT fire many update_task calls in parallel -- that overwhelms the server).',
     {
       id: z.string().describe('The task ID to update'),
       title: z.string().optional().describe('New task title'),
@@ -464,7 +478,7 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'update_milestone',
-    'Update a single Accelo milestone\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates are interpreted in the deployment timezone. Single-object edit -- does NOT cascade to the milestone\'s tasks.',
+    'Update a single Accelo milestone\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates are interpreted in the deployment timezone. Single-object edit -- does NOT cascade to the milestone\'s tasks. To change many milestones/tasks at once, use reschedule_plan.',
     {
       id: z.string().describe('The milestone ID to update'),
       title: z.string().optional().describe('New milestone title'),
@@ -486,6 +500,93 @@ export function registerProjectTools(server, subject) {
       await acceloWrite(token, 'PUT', `/milestones/${encodeURIComponent(id)}`, body);
       const after = (await acceloGet(token, `/milestones/${encodeURIComponent(id)}`, { _fields: MILESTONE_FIELDS })).response;
       return ok({ status: 'updated', milestone: after ? decorateMilestone(after) : null, applied: diff });
+    }
+  );
+
+  server.tool(
+    'reschedule_plan',
+    'Bulk-update many tasks and/or milestones (titles and/or planned dates) in ONE call. WRITE OPERATION: requires confirm:true. The server processes every item SEQUENTIALLY (one Accelo write at a time), so this is the correct way to reschedule a project plan -- do NOT fire many parallel update_task/update_milestone calls (that overwhelms the server). First call (no confirm) returns a combined before/after diff for every item; second call with confirm:true applies them in order and returns a per-item result summary (one failure does not abort the rest). Dates are YYYY-MM-DD in the deployment timezone. Does NOT cascade dependencies -- you supply the exact target dates for each item.',
+    {
+      tasks: z.array(z.object({
+        id: z.string().describe('Task ID'),
+        title: z.string().optional().describe('New title'),
+        planned_start: z.string().optional().describe('New planned start YYYY-MM-DD'),
+        planned_due: z.string().optional().describe('New planned due YYYY-MM-DD'),
+      })).optional().describe('Tasks to update'),
+      milestones: z.array(z.object({
+        id: z.string().describe('Milestone ID'),
+        title: z.string().optional().describe('New title'),
+        planned_start: z.string().optional().describe('New planned start YYYY-MM-DD'),
+        planned_due: z.string().optional().describe('New planned due YYYY-MM-DD'),
+      })).optional().describe('Milestones to update'),
+      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the combined diff only.'),
+    },
+    async ({ tasks, milestones, confirm }) => {
+      const token = await getValidAcceloToken(subject);
+      const taskItems = Array.isArray(tasks) ? tasks : [];
+      const msItems = Array.isArray(milestones) ? milestones : [];
+      if (!taskItems.length && !msItems.length) {
+        return ok({ status: 'error', message: 'Provide a tasks and/or milestones array.' });
+      }
+
+      // ----- Preview: sequential GETs to build a combined diff -----
+      if (confirm !== true) {
+        const taskDiffs = [];
+        for (const it of taskItems) {
+          try {
+            const body = planItemBody(it);
+            if (!Object.keys(body).length) { taskDiffs.push({ id: it.id, error: 'no fields to update' }); continue; }
+            const cur = await getTask(token, it.id);
+            if (!cur) { taskDiffs.push({ id: it.id, error: 'not found' }); continue; }
+            taskDiffs.push({ id: it.id, title: cur.title, change: buildTaskDiff(cur, body) });
+          } catch (e) { taskDiffs.push({ id: it.id, error: e.message }); }
+        }
+        const msDiffs = [];
+        for (const it of msItems) {
+          try {
+            const body = planItemBody(it);
+            if (!Object.keys(body).length) { msDiffs.push({ id: it.id, error: 'no fields to update' }); continue; }
+            const cur = (await acceloGet(token, `/milestones/${encodeURIComponent(it.id)}`, { _fields: MILESTONE_FIELDS })).response;
+            if (!cur) { msDiffs.push({ id: it.id, error: 'not found' }); continue; }
+            msDiffs.push({ id: it.id, title: cur.title, change: buildMilestoneDiff(cur, body) });
+          } catch (e) { msDiffs.push({ id: it.id, error: e.message }); }
+        }
+        return ok({
+          status: 'confirmation_required',
+          message: `This will update ${taskItems.length} task(s) and ${msItems.length} milestone(s) in Accelo, sequentially. Review the combined diff with the user, then call again with confirm: true.`,
+          tasks: taskDiffs,
+          milestones: msDiffs,
+        });
+      }
+
+      // ----- Apply: sequential writes, per-item try/catch -----
+      const results = [];
+      let applied = 0, failed = 0;
+      for (const it of taskItems) {
+        try {
+          const body = planItemBody(it);
+          if (!Object.keys(body).length) { results.push({ type: 'task', id: it.id, ok: false, error: 'no fields to update' }); failed++; continue; }
+          await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(it.id)}`, body);
+          results.push({ type: 'task', id: it.id, ok: true });
+          applied++;
+        } catch (e) {
+          results.push({ type: 'task', id: it.id, ok: false, error: e.message });
+          failed++;
+        }
+      }
+      for (const it of msItems) {
+        try {
+          const body = planItemBody(it);
+          if (!Object.keys(body).length) { results.push({ type: 'milestone', id: it.id, ok: false, error: 'no fields to update' }); failed++; continue; }
+          await acceloWrite(token, 'PUT', `/milestones/${encodeURIComponent(it.id)}`, body);
+          results.push({ type: 'milestone', id: it.id, ok: true });
+          applied++;
+        } catch (e) {
+          results.push({ type: 'milestone', id: it.id, ok: false, error: e.message });
+          failed++;
+        }
+      }
+      return ok({ status: 'completed', applied, failed, results });
     }
   );
 

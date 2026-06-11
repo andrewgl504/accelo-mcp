@@ -4,10 +4,9 @@ import { getValidAcceloToken } from './oauth.js';
 
 // Project-planning module for the Accelo MCP.
 //
-// Phase 1 (read): get_project_plan, list_tasks, get_task, list_task_progressions.
-// Phase 2 (write): update_task, create_task, update_milestone, progress_task,
-//   cancel_task, reschedule_plan (bulk). All writes are confirm:true-guarded
-//   and preview first.
+// Reads:  get_project_plan, list_tasks, get_task, list_task_progressions.
+// Writes (confirm:true-guarded): update_task, create_task, progress_task,
+//   cancel_task, reschedule_plan (bulk tasks).
 //
 // Kept deliberately self-contained (its own fetch helpers + MCP result helper)
 // so it does not collide with concurrent edits to accelo.js / mcp.js. The only
@@ -18,12 +17,14 @@ import { getValidAcceloToken } from './oauth.js';
 //   - A task is attached via against_type/against_id. Usually against a
 //     milestone, but it CAN be against the job directly (not every task has a
 //     milestone), so we query both against(milestone(X)) and against(job(X)).
-//   - MILESTONE ENDPOINT ASYMMETRY (verified live):
-//       READ single   -> GET  /milestones/{id}              (FLAT; job-scoped GET 400s)
-//       LIST for job   -> GET  /milestones?_filters=job({job_id})
-//       WRITE single   -> PUT  /jobs/{job_id}/milestones/{id} (job-scoped; flat PUT 400s)
-//     So we READ FLAT and WRITE JOB-SCOPED. The flat read returns the parent
-//     job id (job/against_id), which we use to build the write path.
+//   - MILESTONES ARE READ-ONLY VIA THE API. Verified live: every write shape
+//     returns 400 "resource endpoint was not recognized" -- flat
+//     PUT /milestones/{id} AND job-scoped PUT /jobs/{job_id}/milestones/{id}.
+//     Accelo exposes no milestone update endpoint. Milestone dates DERIVE from
+//     their child tasks (recalculated by Accelo's planner, and not necessarily
+//     instantly on an API task write). => To move a milestone, reschedule its
+//     TASKS; the milestone follows. Reads: GET /milestones/{id} (single) and
+//     GET /milestones?_filters=job({job_id}) (list).
 //   - There are NO dependency fields in the REST API. `ordering` is only the
 //     display row within a milestone/job and is mostly-but-not-always linear;
 //     it is NOT a dependency model. Authoritative cascades require Accelo's
@@ -66,8 +67,6 @@ const JOB_FIELDS = [
 const MILESTONE_FIELDS = [
   'id', 'title', 'standing', 'milestone_status', 'ordering', 'date_started',
   'date_due', 'date_commenced', 'date_completed', 'manager', 'description',
-  // job/against let us derive the parent job id (milestones write via the
-  // job-scoped endpoint /jobs/{job_id}/milestones/{id}).
   'job', 'against', 'against_id', 'against_type',
 ].join(',');
 
@@ -230,6 +229,15 @@ function statusLabel(s) {
   return STATUS_LABELS[String(s)] ? `${s} (${STATUS_LABELS[String(s)]})` : String(s);
 }
 
+// Derive the parent job id from a milestone record (fields differ by Accelo
+// version: job, against_id, or against="jobs/{id}").
+function milestoneJobId(m) {
+  if (m && m.job && String(m.job) !== '0') return String(m.job);
+  if (m && m.against_id && String(m.against_id) !== '0') return String(m.against_id);
+  if (m && typeof m.against === 'string' && m.against.includes('/')) return m.against.split('/')[1];
+  return null;
+}
+
 function decorateTask(t) {
   return {
     id: t.id,
@@ -269,43 +277,10 @@ function decorateMilestone(m) {
     planned_due: tsToISO(m.date_due),
     actual_commenced: tsToISO(m.date_commenced),
     actual_completed: tsToISO(m.date_completed),
+    // Milestone dates are read-only and DERIVE from child tasks; to move a
+    // milestone, reschedule its tasks.
+    note: 'milestone dates are read-only via API; they derive from child tasks',
   };
-}
-
-// ---------------------------------------------------------------------------
-// Milestone helpers (READ flat /milestones/{id}; WRITE job-scoped
-// /jobs/{job_id}/milestones/{id})
-// ---------------------------------------------------------------------------
-
-// Derive the parent job id from a milestone record (fields differ by Accelo
-// version: job, against_id, or against="jobs/{id}").
-function milestoneJobId(m, explicit) {
-  if (explicit) return String(explicit);
-  if (m && m.job && String(m.job) !== '0') return String(m.job);
-  if (m && m.against_id && String(m.against_id) !== '0') return String(m.against_id);
-  if (m && typeof m.against === 'string' && m.against.includes('/')) return m.against.split('/')[1];
-  return null;
-}
-
-// Read a single milestone. ALWAYS flat -- the job-scoped single GET
-// (/jobs/{job_id}/milestones/{id}) returns 400. (jobId arg kept for call-site
-// compatibility but intentionally unused.)
-async function getMilestone(token, id, _jobId) {
-  const j = await acceloGet(token, `/milestones/${encodeURIComponent(id)}`, { _fields: MILESTONE_FIELDS });
-  return j.response || null;
-}
-
-// Update a milestone via the job-scoped endpoint. jobId may be passed; otherwise
-// it is derived from the freshly-read (flat) milestone record.
-async function writeMilestone(token, id, body, jobIdHint) {
-  const current = await getMilestone(token, id);
-  if (!current) throw new Error(`Milestone ${id} not found.`);
-  const jobId = milestoneJobId(current, jobIdHint);
-  if (!jobId) {
-    throw new Error(`Cannot resolve parent job for milestone ${id}; pass job_id explicitly (milestone writes use /jobs/{job_id}/milestones/{id}).`);
-  }
-  await acceloWrite(token, 'PUT', `/jobs/${encodeURIComponent(jobId)}/milestones/${encodeURIComponent(id)}`, body);
-  return { jobId, after: await getMilestone(token, id) };
 }
 
 async function getTask(token, id) {
@@ -378,17 +353,7 @@ function buildTaskDiff(current, body) {
   return diff;
 }
 
-function buildMilestoneDiff(current, body) {
-  const diff = {};
-  const isoFields = { date_started: 'planned_start', date_due: 'planned_due' };
-  for (const [k, to] of Object.entries(body)) {
-    if (isoFields[k]) diff[isoFields[k]] = { from: tsToISO(current[k]), to: tsToISO(to) };
-    else diff[k] = { from: current[k], to };
-  }
-  return diff;
-}
-
-// Build the {date_started?, date_due?, title?} write body from a plan item.
+// Build the {date_started?, date_due?, title?} write body from a task plan item.
 function planItemBody(item) {
   const body = {};
   if (item.title !== undefined) body.title = item.title;
@@ -402,7 +367,7 @@ export function registerProjectTools(server, subject) {
   // -------- Reads --------
   server.tool(
     'get_project_plan',
-    'Get the full project plan for an Accelo job: the job, its milestones (ordered), the tasks under each milestone (ordered), any tasks attached directly to the job, and a waiting_summary of tasks currently waiting on a client or third party (native task_status 8/12). Dates are shown as ISO (YYYY-MM-DD) planned vs actual, in the deployment timezone. Read-only.',
+    'Get the full project plan for an Accelo job: the job, its milestones (ordered), the tasks under each milestone (ordered), any tasks attached directly to the job, and a waiting_summary of tasks currently waiting on a client or third party (native task_status 8/12). Dates are shown as ISO (YYYY-MM-DD) planned vs actual, in the deployment timezone. Milestone dates are read-only and derive from their tasks. Read-only.',
     { job_id: z.string().describe('The Accelo job (project) ID, e.g. "862"') },
     async ({ job_id }) => {
       const token = await getValidAcceloToken(subject);
@@ -524,57 +489,41 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'update_milestone',
-    'Update a single Accelo milestone\'s title and/or planned dates. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff; call again with confirm:true to apply. Only the provided fields change. Dates are interpreted in the deployment timezone. Milestones are READ flat (/milestones/{id}) and WRITTEN job-scoped (/jobs/{job_id}/milestones/{id}); the parent job is auto-derived from the milestone (pass job_id to skip the derive). Single-object edit -- does NOT cascade to the milestone\'s tasks. To change many milestones/tasks at once, use reschedule_plan.',
+    'NOT SUPPORTED by the Accelo API: milestones cannot be written via REST (every PUT shape returns 400). Milestone dates DERIVE from their child tasks. To move a milestone, reschedule its TASKS (update_task or reschedule_plan) and Accelo recalculates the milestone. This tool returns guidance only and never writes.',
     {
-      id: z.string().describe('The milestone ID to update'),
-      job_id: z.string().optional().describe('Parent job ID (optional; auto-derived from the milestone if omitted)'),
-      title: z.string().optional().describe('New milestone title'),
-      planned_start: z.string().optional().describe('New planned start date as YYYY-MM-DD (or Unix seconds)'),
-      planned_due: z.string().optional().describe('New planned due date as YYYY-MM-DD (or Unix seconds)'),
-      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the diff only.'),
+      id: z.string().optional().describe('The milestone ID (for reference only)'),
     },
-    async ({ id, job_id, title, planned_start, planned_due, confirm }) => {
+    async ({ id }) => {
       const token = await getValidAcceloToken(subject);
-      const body = {};
-      if (title !== undefined) body.title = title;
-      if (planned_start !== undefined) body.date_started = toUnixSeconds(planned_start);
-      if (planned_due !== undefined) body.date_due = toUnixSeconds(planned_due);
-      if (Object.keys(body).length === 0) return ok({ status: 'error', message: 'No updatable fields provided.' });
-      const current = await getMilestone(token, id);
-      if (!current) return ok({ status: 'error', message: `Milestone ${id} not found.` });
-      const diff = buildMilestoneDiff(current, body);
-      if (confirm !== true) return needsConfirmation(`UPDATE milestone ${id} ("${current.title}")`, diff);
-      const { jobId, after } = await writeMilestone(token, id, body, job_id || milestoneJobId(current));
-      return ok({ status: 'updated', milestone: after ? decorateMilestone(after) : null, via: `/jobs/${jobId}/milestones/${id}`, applied: diff });
+      // Best-effort: list the milestone's tasks so the agent can reschedule them.
+      let tasks = [];
+      try { if (id) tasks = await fetchTasksAgainst(token, 'milestone', id); } catch (e) { /* ignore */ }
+      return ok({
+        status: 'not_supported',
+        message: 'Milestones are read-only via the Accelo API. Milestone dates derive from their child tasks. To move this milestone, reschedule its tasks with update_task (single) or reschedule_plan (bulk); Accelo will recalculate the milestone dates.',
+        milestone_id: id || null,
+        tasks_in_milestone: tasks.map((t) => ({ id: t.id, title: t.title, planned_start: t.planned_start, planned_due: t.planned_due })),
+      });
     }
   );
 
   server.tool(
     'reschedule_plan',
-    'Bulk-update many tasks and/or milestones (titles and/or planned dates) in ONE call. WRITE OPERATION: requires confirm:true. The server processes every item SEQUENTIALLY (one Accelo write at a time), so this is the correct way to reschedule a project plan -- do NOT fire many parallel update_task/update_milestone calls (that overwhelms the server). First call (no confirm) returns a combined before/after diff for every item; second call with confirm:true applies them in order and returns a per-item result summary (one failure does not abort the rest). Dates are YYYY-MM-DD in the deployment timezone. Milestones are READ flat and WRITTEN via the job-scoped endpoint (parent job auto-derived, or pass a top-level job_id / per-milestone job_id). Does NOT cascade dependencies -- you supply the exact target dates for each item.',
+    'Bulk-update many TASKS (titles and/or planned dates) in ONE call. WRITE OPERATION: requires confirm:true. The server processes every task SEQUENTIALLY (one Accelo write at a time), so this is the correct way to reschedule a project plan -- do NOT fire many parallel update_task calls (that overwhelms the server). First call (no confirm) returns a combined before/after diff for every task; second call with confirm:true applies them in order and returns a per-task result summary (one failure does not abort the rest). Dates are YYYY-MM-DD in the deployment timezone. NOTE: milestones are NOT updated here -- they are read-only via the API and their dates derive from their child tasks; reschedule the tasks and Accelo recalculates the milestones. Does NOT cascade dependencies -- you supply the exact target dates for each task.',
     {
-      job_id: z.string().optional().describe('Default parent job ID for the milestones (optional; each milestone can also carry its own job_id, else it is auto-derived)'),
       tasks: z.array(z.object({
         id: z.string().describe('Task ID'),
         title: z.string().optional().describe('New title'),
         planned_start: z.string().optional().describe('New planned start YYYY-MM-DD'),
         planned_due: z.string().optional().describe('New planned due YYYY-MM-DD'),
-      })).optional().describe('Tasks to update'),
-      milestones: z.array(z.object({
-        id: z.string().describe('Milestone ID'),
-        job_id: z.string().optional().describe('Parent job ID (optional; falls back to top-level job_id or auto-derive)'),
-        title: z.string().optional().describe('New title'),
-        planned_start: z.string().optional().describe('New planned start YYYY-MM-DD'),
-        planned_due: z.string().optional().describe('New planned due YYYY-MM-DD'),
-      })).optional().describe('Milestones to update'),
+      })).describe('Tasks to update'),
       confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the combined diff only.'),
     },
-    async ({ job_id, tasks, milestones, confirm }) => {
+    async ({ tasks, confirm }) => {
       const token = await getValidAcceloToken(subject);
       const taskItems = Array.isArray(tasks) ? tasks : [];
-      const msItems = Array.isArray(milestones) ? milestones : [];
-      if (!taskItems.length && !msItems.length) {
-        return ok({ status: 'error', message: 'Provide a tasks and/or milestones array.' });
+      if (!taskItems.length) {
+        return ok({ status: 'error', message: 'Provide a tasks array. (Milestones are read-only and derive from their tasks.)' });
       }
 
       // ----- Preview: sequential GETs to build a combined diff -----
@@ -589,21 +538,10 @@ export function registerProjectTools(server, subject) {
             taskDiffs.push({ id: it.id, title: cur.title, change: buildTaskDiff(cur, body) });
           } catch (e) { taskDiffs.push({ id: it.id, error: e.message }); }
         }
-        const msDiffs = [];
-        for (const it of msItems) {
-          try {
-            const body = planItemBody(it);
-            if (!Object.keys(body).length) { msDiffs.push({ id: it.id, error: 'no fields to update' }); continue; }
-            const cur = await getMilestone(token, it.id);
-            if (!cur) { msDiffs.push({ id: it.id, error: 'not found' }); continue; }
-            msDiffs.push({ id: it.id, title: cur.title, change: buildMilestoneDiff(cur, body) });
-          } catch (e) { msDiffs.push({ id: it.id, error: e.message }); }
-        }
         return ok({
           status: 'confirmation_required',
-          message: `This will update ${taskItems.length} task(s) and ${msItems.length} milestone(s) in Accelo, sequentially. Review the combined diff with the user, then call again with confirm: true.`,
+          message: `This will update ${taskItems.length} task(s) in Accelo, sequentially. Milestones are not written (they derive from their tasks). Review the combined diff with the user, then call again with confirm: true.`,
           tasks: taskDiffs,
-          milestones: msDiffs,
         });
       }
 
@@ -622,19 +560,13 @@ export function registerProjectTools(server, subject) {
           failed++;
         }
       }
-      for (const it of msItems) {
-        try {
-          const body = planItemBody(it);
-          if (!Object.keys(body).length) { results.push({ type: 'milestone', id: it.id, ok: false, error: 'no fields to update' }); failed++; continue; }
-          const { jobId } = await writeMilestone(token, it.id, body, it.job_id || job_id);
-          results.push({ type: 'milestone', id: it.id, ok: true, via: `/jobs/${jobId}/milestones/${it.id}` });
-          applied++;
-        } catch (e) {
-          results.push({ type: 'milestone', id: it.id, ok: false, error: e.message });
-          failed++;
-        }
-      }
-      return ok({ status: 'completed', applied, failed, results });
+      return ok({
+        status: 'completed',
+        applied,
+        failed,
+        results,
+        note: 'Milestones were not written (read-only via API). Their dates derive from these tasks and are recalculated by Accelo.',
+      });
     }
   );
 

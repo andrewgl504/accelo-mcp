@@ -3,6 +3,7 @@ import { z } from 'zod';
 import * as accelo from './accelo.js';
 import { getValidAcceloToken } from './oauth.js';
 import { registerProjectTools } from './projects.js';
+import { registerActivityTools } from './activities.js';
 
 function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
@@ -64,7 +65,7 @@ function pickEditableFields(args) {
 // (i.e. one Accelo user). All Accelo calls run as that user, so Accelo's
 // own permission model is respected.
 export function buildServer(subject) {
-  const server = new McpServer({ name: 'accelo-mcp', version: '0.3.0' });
+  const server = new McpServer({ name: 'accelo-mcp', version: '0.4.0' });
 
   server.tool(
     'list_quotes',
@@ -146,8 +147,11 @@ export function buildServer(subject) {
     }
   );
 
-  // Project-planning read tools (get_project_plan, list_tasks, get_task).
+  // Project-planning tools (read + task/milestone writes).
   registerProjectTools(server, subject);
+
+  // Activity tools (notes/emails/time, threading, provenance).
+  registerActivityTools(server, subject);
 
   return server;
 }
